@@ -12,6 +12,7 @@ from datetime import datetime
 import psycopg2
 import nats
 from nats.js.api import ConsumerConfig
+from shadow_simulator import ShadowSimulator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("fb-analytics")
@@ -181,6 +182,10 @@ class AnalyticsService:
                                  config=ConsumerConfig(ack_wait=30))
         
         logger.info("fb-analytics online. Aguardando trades serem fechados...")
+        
+        # Inicia o simulador fantasma em background
+        shadow = ShadowSimulator(DATABASE_URL)
+        asyncio.create_task(shadow.run_loop())
         
         while True:
             if self.nc.is_closed:
