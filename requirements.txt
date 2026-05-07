@@ -1,2 +1,3 @@
-redis
+nats-py
 psycopg2-binary
+pandas
