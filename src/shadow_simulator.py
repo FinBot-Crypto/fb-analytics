@@ -115,64 +115,114 @@ class ShadowSimulator:
 
         return results
 
+    async def _save_empty_simulation(self, trade_id, symbol, tier, rsi_entry, hour_entry):
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: self._db_save_empty(trade_id, symbol, tier, rsi_entry, hour_entry))
+        except Exception as e:
+            logger.error(f"Erro ao salvar simulacao vazia para #{trade_id}: {e}")
+
+    def _db_save_empty(self, trade_id, symbol, tier, rsi_entry, hour_entry):
+        conn = psycopg2.connect(self.db_url)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO shadow_metrics (trade_id, symbol, tier, rsi_entry, hour_entry, simulations)
+            VALUES (%s, %s, %s, %s, %s, '[]'::jsonb)
+            ON CONFLICT (trade_id) DO UPDATE SET
+                tier = EXCLUDED.tier,
+                rsi_entry = EXCLUDED.rsi_entry,
+                hour_entry = EXCLUDED.hour_entry,
+                simulations = EXCLUDED.simulations
+        """, (trade_id, symbol, tier, rsi_entry, hour_entry))
+        conn.commit()
+        cur.close()
+        conn.close()
+
     async def run_loop(self):
         logger.info("Shadow Simulator iniciado...")
         self.init_db()
 
         while True:
             try:
-                conn = psycopg2.connect(self.db_url)
-                cur = conn.cursor()
-                # Puxa trades com mais de 12 horas que ainda não foram simulados
-                # Inclui tier, rsi e hora da entrada
-                cur.execute("""
-                    SELECT id, symbol, entry_price, sl_price, created_at, tier, rsi
-                    FROM trade_log
-                    WHERE created_at < NOW() - INTERVAL '12 hours'
-                      AND id NOT IN (SELECT trade_id FROM shadow_metrics)
-                    LIMIT 20
-                """)
-                trades = cur.fetchall()
-                cur.close()
-                conn.close()
+                loop = asyncio.get_event_loop()
+                trades = await loop.run_in_executor(None, self._db_fetch_pending_trades)
+
+                if not trades:
+                    await asyncio.sleep(600)  # Fila vazia, dorme 10 min
+                    continue
 
                 for trade in trades:
                     trade_id, symbol, entry_price, sl_price, created_at, tier, rsi_entry = trade
+                    hour_entry = created_at.hour if created_at else None
 
-                    if not sl_price or sl_price >= entry_price:
+                    if not entry_price or entry_price <= 0:
+                        logger.warning(f"Trade #{trade_id} com preco de entrada invalido. Pulando.")
+                        await self._save_empty_simulation(trade_id, symbol, tier, rsi_entry, hour_entry)
                         continue
 
-                    atr = (entry_price - sl_price) / 2.0
-                    hour_entry = created_at.hour if created_at else None
+                    # Se sl_price for invalido ou 0, usamos ATR estimado de 1.5% do entry_price
+                    if not sl_price or sl_price <= 0 or sl_price >= entry_price:
+                        atr = entry_price * 0.015
+                    else:
+                        atr = (entry_price - sl_price) / 2.0
 
                     logger.info(f"Simulando trade #{trade_id} ({symbol}) tier={tier} RSI={rsi_entry} hora={hour_entry}...")
                     ohlcv = await self.fetch_1m_data(symbol, created_at)
 
                     if not ohlcv:
-                        logger.warning(f"Sem dados OHLCV para {symbol}. Pulando.")
+                        logger.warning(f"Sem dados OHLCV para {symbol}. Salvando simulacao vazia para destravar fila.")
+                        await self._save_empty_simulation(trade_id, symbol, tier, rsi_entry, hour_entry)
                         continue
 
                     simulations = self.simulate_trade(ohlcv, entry_price, atr)
 
-                    conn = psycopg2.connect(self.db_url)
-                    cur = conn.cursor()
-                    cur.execute("""
-                        INSERT INTO shadow_metrics (trade_id, symbol, tier, rsi_entry, hour_entry, simulations)
-                        VALUES (%s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (trade_id) DO UPDATE SET
-                            tier = EXCLUDED.tier,
-                            rsi_entry = EXCLUDED.rsi_entry,
-                            hour_entry = EXCLUDED.hour_entry,
-                            simulations = EXCLUDED.simulations
-                    """, (trade_id, symbol, tier, rsi_entry, hour_entry, json.dumps(simulations)))
-                    conn.commit()
-                    cur.close()
-                    conn.close()
+                    await loop.run_in_executor(None, lambda: self._db_save_simulations(
+                        trade_id, symbol, tier, rsi_entry, hour_entry, simulations
+                    ))
 
                     logger.info(f"Simulação para #{trade_id} finalizada com {len(simulations)} cenários.")
                     await asyncio.sleep(1)
 
+                # Se processou 20 itens, pode ter mais pendentes. Roda em 5s em vez de 10m.
+                if len(trades) == 20:
+                    logger.info("Leva de 20 concluida. Processando proxima leva em 5s...")
+                    await asyncio.sleep(5)
+                else:
+                    await asyncio.sleep(600)
+
             except Exception as e:
                 logger.error(f"Erro no loop do shadow simulator: {e}")
+                await asyncio.sleep(60)
 
-            await asyncio.sleep(600)  # Roda a cada 10 min
+    def _db_fetch_pending_trades(self):
+        conn = psycopg2.connect(self.db_url)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, symbol, entry_price, sl_price, created_at, tier, rsi
+            FROM trade_log
+            WHERE created_at < NOW() - INTERVAL '12 hours'
+              AND id NOT IN (SELECT trade_id FROM shadow_metrics)
+            ORDER BY created_at ASC
+            LIMIT 20
+        """)
+        trades = cur.fetchall()
+        cur.close()
+        conn.close()
+        return trades
+
+    def _db_save_simulations(self, trade_id, symbol, tier, rsi_entry, hour_entry, simulations):
+        conn = psycopg2.connect(self.db_url)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO shadow_metrics (trade_id, symbol, tier, rsi_entry, hour_entry, simulations)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (trade_id) DO UPDATE SET
+                tier = EXCLUDED.tier,
+                rsi_entry = EXCLUDED.rsi_entry,
+                hour_entry = EXCLUDED.hour_entry,
+                simulations = EXCLUDED.simulations
+        """, (trade_id, symbol, tier, rsi_entry, hour_entry, json.dumps(simulations)))
+        conn.commit()
+        cur.close()
+        conn.close()
+
