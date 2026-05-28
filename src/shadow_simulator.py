@@ -161,7 +161,7 @@ class ShadowSimulator:
                         continue
 
                     # Se sl_price for invalido ou 0, usamos ATR estimado de 1.5% do entry_price
-                    if not sl_price or sl_price <= 0 or sl_price >= entry_price:
+                    if not sl_price or sl_price <= 0:
                         atr = entry_price * 0.015
                     else:
                         atr = (entry_price - sl_price) / 2.0
