@@ -304,6 +304,7 @@ class BTCTrendFetcher:
         self.exchange = exchange
         self.lookback_days = lookback_days
         self._trend_map = None
+        self._period = int(os.getenv("BTC_SMA_PERIOD", "12"))
 
     async def _fetch_btc_1h(self):
         limit = self.lookback_days * 24 + 50
@@ -315,17 +316,17 @@ class BTCTrendFetcher:
 
     def build_trend_map(self, ohlcv_1h):
         closes = np.array([c[4] for c in ohlcv_1h])
-        sma50 = self._sma(closes, 50)
+        sma = self._sma(closes, self._period)
         trend_map = {}
         for i, candle in enumerate(ohlcv_1h):
             ts = candle[0] / 1000
-            if i < 50 or np.isnan(sma50[i]):
+            if i < self._period or np.isnan(sma[i]):
                 continue
             close = closes[i]
-            sma = sma50[i]
-            if close > sma * 1.01:
+            sma_val = sma[i]
+            if close > sma_val * 1.01:
                 trend_map[int(ts)] = "bull"
-            elif close < sma * 0.99:
+            elif close < sma_val * 0.99:
                 trend_map[int(ts)] = "bear"
             else:
                 trend_map[int(ts)] = "neutral"
