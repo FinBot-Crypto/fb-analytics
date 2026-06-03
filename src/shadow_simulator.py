@@ -299,6 +299,58 @@ class LSTMShortModel(nn.Module):
         return torch.sigmoid(self.fc(o[:, -1, :]))
 
 
+class BTCTrendFetcher:
+    def __init__(self, exchange, lookback_days=30):
+        self.exchange = exchange
+        self.lookback_days = lookback_days
+        self._trend_map = None
+
+    async def _fetch_btc_1h(self):
+        limit = self.lookback_days * 24 + 50
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, lambda: self.exchange.fetch_ohlcv('BTC/USDT', '1h', limit=limit))
+
+    def _sma(self, values, period=50):
+        return pd.Series(values).rolling(period).mean().values
+
+    def build_trend_map(self, ohlcv_1h):
+        closes = np.array([c[4] for c in ohlcv_1h])
+        sma50 = self._sma(closes, 50)
+        trend_map = {}
+        for i, candle in enumerate(ohlcv_1h):
+            ts = candle[0] / 1000
+            if i < 50 or np.isnan(sma50[i]):
+                continue
+            close = closes[i]
+            sma = sma50[i]
+            if close > sma * 1.01:
+                trend_map[int(ts)] = "bull"
+            elif close < sma * 0.99:
+                trend_map[int(ts)] = "bear"
+            else:
+                trend_map[int(ts)] = "neutral"
+        return trend_map
+
+    async def get_trend_map(self):
+        if self._trend_map is not None:
+            return self._trend_map
+        ohlcv = await self._fetch_btc_1h()
+        if ohlcv:
+            self._trend_map = self.build_trend_map(ohlcv)
+        else:
+            self._trend_map = {}
+        return self._trend_map
+
+    def lookup(self, entry_ts, default="neutral"):
+        if not self._trend_map:
+            return default
+        ts = int(entry_ts.timestamp())
+        closest = max((t for t in self._trend_map if t <= ts), default=None)
+        if closest is None:
+            return default
+        return self._trend_map.get(closest, default)
+
+
 class ShortShadowScanner:
     MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")
     SHORT_MODEL_FILES = {
@@ -322,6 +374,7 @@ class ShortShadowScanner:
         self._models = {}
         self._model_seqs = {}
         self._load_models()
+        self._btc_trend = BTCTrendFetcher(self.exchange, self.lookback_days)
 
     def _load_models(self):
         for tier, fname in self.SHORT_MODEL_FILES.items():
@@ -405,6 +458,10 @@ class ShortShadowScanner:
         """)
         try:
             cur.execute("ALTER TABLE shadow_short_metrics ADD COLUMN IF NOT EXISTS model_score FLOAT")
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE shadow_short_metrics ADD COLUMN IF NOT EXISTS btc_trend VARCHAR(10)")
         except Exception:
             pass
         conn.commit()
@@ -534,11 +591,12 @@ class ShortShadowScanner:
                 continue
 
             entry_ts = datetime.fromtimestamp(ohlcv[i][0] / 1000, tz=timezone.utc)
+            btc_t = self._btc_trend.lookup(entry_ts)
             for s in sims:
                 entries.append((
                     symbol, tier, round(rsi, 1), entry_ts.hour,
                     ohlcv[i][4], s["sl"], s["tp"], s["pnl"],
-                    s["reason"], s["minutes"], s["entry_ts"], model_score
+                    s["reason"], s["minutes"], s["entry_ts"], model_score, btc_t
                 ))
 
         if entries:
@@ -561,8 +619,8 @@ class ShortShadowScanner:
         for e in entries:
             cur.execute("""
                 INSERT INTO shadow_short_metrics
-                    (symbol, tier, rsi_entry, hour_entry, entry_price, sl, tp, pnl, exit_reason, minutes, entry_ts, model_score)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (symbol, tier, rsi_entry, hour_entry, entry_price, sl, tp, pnl, exit_reason, minutes, entry_ts, model_score, btc_trend)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, e)
         conn.commit()
         cur.close()
@@ -572,6 +630,7 @@ class ShortShadowScanner:
         logger.info(f"Iniciando scan SHORT (RSI >= {self.rsi_threshold}, {self.lookback_days}d)...")
         self.init_db()
         symbols = await self._get_monitored_symbols()
+        await self._btc_trend.get_trend_map()
         logger.info(f"Escaneando {len(symbols)} símbolos para SHORT...")
 
         total = 0
@@ -618,6 +677,7 @@ class LongShadowScanner:
         self._models = {}
         self._model_seqs = {}
         self._load_models()
+        self._btc_trend = BTCTrendFetcher(self.exchange, self.lookback_days)
 
     def _load_models(self):
         for tier, fname in self.LONG_MODEL_FILES.items():
@@ -658,6 +718,10 @@ class LongShadowScanner:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_long_scan_symbol ON shadow_long_scan(symbol)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_long_scan_entry_ts ON shadow_long_scan(entry_ts)")
+        try:
+            cur.execute("ALTER TABLE shadow_long_scan ADD COLUMN IF NOT EXISTS btc_trend VARCHAR(10)")
+        except Exception:
+            pass
         conn.commit()
         cur.close()
         conn.close()
@@ -799,11 +863,12 @@ class LongShadowScanner:
             if not sims:
                 continue
             entry_ts = datetime.fromtimestamp(ohlcv[i][0] / 1000, tz=timezone.utc)
+            btc_t = self._btc_trend.lookup(entry_ts)
             for s in sims:
                 entries.append((
                     symbol, tier, round(rsi, 1), entry_ts.hour,
                     ohlcv[i][4], s["sl"], s["tp"], s["pnl"],
-                    s["reason"], s["minutes"], s["entry_ts"], score,
+                    s["reason"], s["minutes"], s["entry_ts"], score, btc_t
                 ))
         if entries:
             loop = asyncio.get_event_loop()
@@ -818,8 +883,8 @@ class LongShadowScanner:
                      (entries[0][0], entries[0][10] - timedelta(days=self.lookback_days + 1)))
         for e in entries:
             cur.execute("""
-                INSERT INTO shadow_long_scan (symbol, tier, rsi_entry, hour_entry, entry_price, sl, tp, pnl, exit_reason, minutes, entry_ts, model_score)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO shadow_long_scan (symbol, tier, rsi_entry, hour_entry, entry_price, sl, tp, pnl, exit_reason, minutes, entry_ts, model_score, btc_trend)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, e)
         conn.commit()
         cur.close()
@@ -829,6 +894,7 @@ class LongShadowScanner:
         logger.info(f"Iniciando scan LONG (RSI < {self.rsi_threshold}, score >= {self.min_score}, {self.lookback_days}d)...")
         self.init_db()
         symbols = await self._get_monitored_symbols()
+        await self._btc_trend.get_trend_map()
         logger.info(f"Escaneando {len(symbols)} simbolos para LONG...")
         total = 0
         for symbol in symbols:
