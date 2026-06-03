@@ -2,3 +2,5 @@ nats-py
 psycopg2-binary
 pandas
 ccxt
+torch
+numpy

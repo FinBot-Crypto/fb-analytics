@@ -12,7 +12,7 @@ from datetime import datetime
 import psycopg2
 import nats
 from nats.js.api import ConsumerConfig
-from shadow_simulator import ShadowSimulator
+from shadow_simulator import ShadowSimulator, ShortShadowScanner, LongShadowScanner
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("fb-analytics")
@@ -183,9 +183,17 @@ class AnalyticsService:
         
         logger.info("fb-analytics online. Aguardando trades serem fechados...")
         
-        # Inicia o simulador fantasma em background
+        # Inicia o simulador fantasma LONG em background
         shadow = ShadowSimulator(DATABASE_URL)
         asyncio.create_task(shadow.run_loop())
+
+        # Inicia o simulador fantasma LONG via modelos (scan OHLCV)
+        long_shadow = LongShadowScanner(DATABASE_URL)
+        asyncio.create_task(long_shadow.run_loop())
+
+        # Inicia o simulador fantasma SHORT em background
+        short_shadow = ShortShadowScanner(DATABASE_URL)
+        asyncio.create_task(short_shadow.run_loop())
         
         while True:
             if self.nc.is_closed:
