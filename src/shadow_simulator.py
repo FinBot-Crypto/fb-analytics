@@ -355,14 +355,21 @@ class BTCTrendFetcher:
 
     def get_btc_sma_ratios(self):
         if self._trend_map is None:
-            return np.array([1.0, 1.0, 1.0, 1.0])
+            return np.zeros(5)
         try:
             ohlcv = self._btc_ohlcv_cache
             if ohlcv is None or len(ohlcv) < 50:
-                return np.array([1.0, 1.0, 1.0, 1.0])
+                return np.zeros(5)
             closes = np.array([c[4] for c in ohlcv])
             current = closes[-1]
-            ratios = []
+            # BTC RSI(14)
+            delta = np.diff(closes, prepend=closes[0])
+            g = np.maximum(delta, 0)
+            l = -np.minimum(delta, 0)
+            ag = pd.Series(g).rolling(14).mean().values
+            al = pd.Series(l).rolling(14).mean().values
+            btc_rsi = (100 - 100 / (1 + ag / (al + 1e-10)))[-1]
+            ratios = [(btc_rsi - 50) / 10]
             for p in [12, 24, 36, 48]:
                 if len(closes) >= p:
                     ratios.append(current / max(closes[-p:].mean(), 1))
@@ -370,7 +377,7 @@ class BTCTrendFetcher:
                     ratios.append(1.0)
             return np.array(ratios)
         except Exception:
-            return np.array([1.0, 1.0, 1.0, 1.0])
+            return np.zeros(5)
 
 
 class ShortShadowScanner:
@@ -441,6 +448,8 @@ class ShortShadowScanner:
         btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
+        funding_oi = np.zeros((len(feats), 3))
+        feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
 
@@ -799,6 +808,8 @@ class LongShadowScanner:
         btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
+        funding_oi = np.zeros((len(feats), 3))
+        feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
 
