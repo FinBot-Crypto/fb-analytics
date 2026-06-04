@@ -448,7 +448,7 @@ class ShortShadowScanner:
         btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
-        funding_oi = np.zeros((len(feats), 3))
+        funding_oi = np.zeros((len(feats), 4))
         feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
@@ -808,7 +808,7 @@ class LongShadowScanner:
         btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
-        funding_oi = np.zeros((len(feats), 3))
+        funding_oi = np.zeros((len(feats), 4))
         feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
