@@ -304,6 +304,7 @@ class BTCTrendFetcher:
         self.exchange = exchange
         self.lookback_days = lookback_days
         self._trend_map = None
+        self._btc_ohlcv_cache = None
         self._period = int(os.getenv("BTC_SMA_PERIOD", "12"))
 
     async def _fetch_btc_1h(self):
@@ -337,6 +338,7 @@ class BTCTrendFetcher:
             return self._trend_map
         ohlcv = await self._fetch_btc_1h()
         if ohlcv:
+            self._btc_ohlcv_cache = ohlcv
             self._trend_map = self.build_trend_map(ohlcv)
         else:
             self._trend_map = {}
@@ -350,6 +352,25 @@ class BTCTrendFetcher:
         if closest is None:
             return default
         return self._trend_map.get(closest, default)
+
+    def get_btc_sma_ratios(self):
+        if self._trend_map is None:
+            return np.array([1.0, 1.0, 1.0, 1.0])
+        try:
+            ohlcv = self._btc_ohlcv_cache
+            if ohlcv is None or len(ohlcv) < 50:
+                return np.array([1.0, 1.0, 1.0, 1.0])
+            closes = np.array([c[4] for c in ohlcv])
+            current = closes[-1]
+            ratios = []
+            for p in [12, 24, 36, 48]:
+                if len(closes) >= p:
+                    ratios.append(current / max(closes[-p:].mean(), 1))
+                else:
+                    ratios.append(1.0)
+            return np.array(ratios)
+        except Exception:
+            return np.array([1.0, 1.0, 1.0, 1.0])
 
 
 class ShortShadowScanner:
@@ -417,6 +438,9 @@ class ShortShadowScanner:
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
+        btc_sma = self._btc_trend.get_btc_sma_ratios()
+        btc_feats = np.tile(btc_sma, (len(feats), 1))
+        feats = np.hstack([feats, btc_feats])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
 
@@ -425,7 +449,9 @@ class ShortShadowScanner:
             return None
         model = self._models[tier]
         seq_len = self._model_seqs.get(tier, 144)
-        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
+        nf = model.lstm.input_size
+        feats = features[-seq_len:, :nf]
+        X = torch.from_numpy(feats).unsqueeze(0).float()
         with torch.no_grad():
             proba = model(X).item()
         return round(proba, 4)
@@ -770,6 +796,9 @@ class LongShadowScanner:
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
+        btc_sma = self._btc_trend.get_btc_sma_ratios()
+        btc_feats = np.tile(btc_sma, (len(feats), 1))
+        feats = np.hstack([feats, btc_feats])
         feats = np.nan_to_num(feats, nan=0.0)
         return feats[-seq_len:], rsi_14[-1]
 
@@ -778,7 +807,9 @@ class LongShadowScanner:
             return None
         model = self._models[tier]
         seq_len = self._model_seqs.get(tier, 144)
-        X = torch.from_numpy(features[-seq_len:]).unsqueeze(0).float()
+        nf = model.lstm.input_size
+        feats = features[-seq_len:, :nf]
+        X = torch.from_numpy(feats).unsqueeze(0).float()
         with torch.no_grad():
             proba = model(X).item()
         return round(proba, 4)
