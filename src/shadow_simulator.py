@@ -705,7 +705,7 @@ class LongShadowScanner:
         self.sl_multipliers = [2, 3, 4, 5, 6, None]
         self.tp_multipliers = [2, 3, 4, 5, 6, 8, 10, None]
         self.rsi_threshold = float(os.getenv("LONG_RSI_THRESHOLD", "35"))
-        self.min_score = float(os.getenv("LONG_MIN_SCORE_SHADOW", "0.65"))
+        self.min_score = float(os.getenv("LONG_MIN_SCORE_SHADOW", "0.0"))
         self.lookback_days = int(os.getenv("LONG_SCAN_LOOKBACK_DAYS", "30"))
         self.scan_interval_hours = int(os.getenv("LONG_SCAN_INTERVAL_HOURS", "6"))
         self.atr_pct = 0.015
