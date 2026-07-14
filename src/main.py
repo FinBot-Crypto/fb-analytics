@@ -245,8 +245,27 @@ class AnalyticsService:
             conn = psycopg2.connect(DATABASE_URL)
             cur = conn.cursor()
 
-            cur.execute("SELECT symbol, tier FROM market_selection")
-            symbol_tiers = {r[0]: r[1] for r in cur.fetchall()}
+            # Buscar mapeamento symbol->tier da evaluations_log (sempre atualizada pelo strategy-ml)
+            cur.execute("""
+                SELECT DISTINCT ON (symbol) symbol, tier 
+                FROM evaluations_log 
+                WHERE tier IS NOT NULL 
+                ORDER BY symbol, created_at DESC
+            """)
+            rows_ev = cur.fetchall()
+            if not rows_ev:
+                # Fallback: usar trade_log que também tem coluna tier
+                cur.execute("SELECT DISTINCT symbol, tier FROM trade_log WHERE tier IS NOT NULL")
+                rows_ev = cur.fetchall()
+            symbol_tiers = {r[0]: r[1] for r in rows_ev}
+            # Normalizar: remover sufixo /USDT se necessário para compatibilidade
+            symbol_tiers_norm = {}
+            for sym, tier in symbol_tiers.items():
+                symbol_tiers_norm[sym] = tier
+                if "/USDT" in sym:
+                    symbol_tiers_norm[sym.replace("/USDT", "")] = tier
+            symbol_tiers = symbol_tiers_norm
+
 
             for direction, tier in groups:
                 group_name = f"{direction}_{tier}"
