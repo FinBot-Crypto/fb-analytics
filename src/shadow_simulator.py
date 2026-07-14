@@ -379,6 +379,31 @@ class BTCTrendFetcher:
         except Exception:
             return np.zeros(5)
 
+    def get_historical_btc_sma_ratios(self, timestamp_ms):
+        if self._btc_ohlcv_cache is None:
+            return np.zeros(5)
+        try:
+            sliced_ohlcv = [c for c in self._btc_ohlcv_cache if c[0] <= timestamp_ms]
+            if len(sliced_ohlcv) < 50:
+                return np.zeros(5)
+            closes = np.array([c[4] for c in sliced_ohlcv])
+            current = closes[-1]
+            delta = np.diff(closes, prepend=closes[0])
+            g = np.maximum(delta, 0)
+            l = -np.minimum(delta, 0)
+            ag = pd.Series(g).rolling(14).mean().values
+            al = pd.Series(l).rolling(14).mean().values
+            btc_rsi = (100 - 100 / (1 + ag / (al + 1e-10)))[-1]
+            ratios = [(btc_rsi - 50) / 10]
+            for p in [12, 24, 36, 48]:
+                if len(closes) >= p:
+                    ratios.append(current / max(closes[-p:].mean(), 1))
+                else:
+                    ratios.append(1.0)
+            return np.array(ratios)
+        except Exception:
+            return np.zeros(5)
+
 
 class ShortShadowScanner:
     MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")
@@ -421,37 +446,35 @@ class ShortShadowScanner:
             self._model_seqs[tier] = cfg.get("seq_len", 144)
             logger.info(f"ShortShadow: modelo SHORT carregado: {tier} ({fname})")
 
-    def _compute_model_features(self, closes, seq_len=144):
+    def _compute_model_features(self, closes, seq_len=144, timestamp_ms=None):
         closes = np.array(closes, dtype=np.float64)
         min_needed = seq_len + 56 + 16
         if len(closes) < min_needed:
             return None, None
         period = 56
-        n = len(closes)
-        rsi_14 = np.full(n, np.nan)
-        gains = np.maximum(np.diff(closes), 0)
-        losses = -np.minimum(np.diff(closes), 0)
-        ag = gains[:period].mean()
-        al = max(losses[:period].mean(), 1e-10)
-        rsi_14[period] = 100 - 100 / (1 + ag / al)
-        for i in range(period + 1, n):
-            ag = (ag * (period - 1) + gains[i - 1]) / period
-            al = (al * (period - 1) + losses[i - 1]) / period
-            rsi_14[i] = 100 - 100 / (1 + ag / max(al, 1e-10))
-        rsi_smooth = pd.Series(rsi_14).ewm(span=2, adjust=False).mean().values
-        rsi_4h = pd.Series(rsi_14).rolling(16).mean().values
+        delta = np.diff(closes, prepend=closes[0])
+        gain = np.maximum(delta, 0)
+        loss = -np.minimum(delta, 0)
+        avg_gain = pd.Series(gain).rolling(period).mean().values
+        avg_loss = pd.Series(loss).rolling(period).mean().values
+        rsi_vals = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
+        rsi_smooth = pd.Series(rsi_vals).ewm(span=2, adjust=False).mean().values
+        rsi_4h = pd.Series(rsi_vals).rolling(16).mean().values
         feats = np.column_stack([
-            (rsi_14 - 50) / 10,
+            (rsi_vals - 50) / 10,
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
-        btc_sma = self._btc_trend.get_btc_sma_ratios()
+        if timestamp_ms is not None:
+            btc_sma = self._btc_trend.get_historical_btc_sma_ratios(timestamp_ms)
+        else:
+            btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
         funding_oi = np.zeros((len(feats), 4))
         feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
-        return feats[-seq_len:], rsi_14[-1]
+        return feats[-seq_len:], rsi_vals[-1]
 
     def _predict_short_score(self, tier, features):
         if tier not in self._models:
@@ -619,7 +642,7 @@ class ShortShadowScanner:
 
             model_score = None
             if i >= seq_len + 56 + 16:
-                feats, _ = self._compute_model_features(closes[:i + 1], seq_len)
+                feats, _ = self._compute_model_features(closes[:i + 1], seq_len, ohlcv[i][0])
                 if feats is not None:
                     model_score = self._predict_short_score(tier, feats)
 
@@ -782,36 +805,34 @@ class LongShadowScanner:
         self._symbols_cache = list(SYMBOL_TIERS.keys())
         return self._symbols_cache
 
-    def _compute_features(self, closes, seq_len=144):
+    def _compute_features(self, closes, seq_len=144, timestamp_ms=None):
         closes = np.array(closes, dtype=np.float64)
         if len(closes) < seq_len + 56 + 16:
             return None, None
         period = 56
-        n = len(closes)
-        rsi_14 = np.full(n, np.nan)
-        gains = np.maximum(np.diff(closes), 0)
-        losses = -np.minimum(np.diff(closes), 0)
-        ag = gains[:period].mean()
-        al = max(losses[:period].mean(), 1e-10)
-        rsi_14[period] = 100 - 100 / (1 + ag / al)
-        for i in range(period + 1, n):
-            ag = (ag * (period - 1) + gains[i - 1]) / period
-            al = (al * (period - 1) + losses[i - 1]) / period
-            rsi_14[i] = 100 - 100 / (1 + ag / max(al, 1e-10))
-        rsi_smooth = pd.Series(rsi_14).ewm(span=2, adjust=False).mean().values
-        rsi_4h = pd.Series(rsi_14).rolling(16).mean().values
+        delta = np.diff(closes, prepend=closes[0])
+        gain = np.maximum(delta, 0)
+        loss = -np.minimum(delta, 0)
+        avg_gain = pd.Series(gain).rolling(period).mean().values
+        avg_loss = pd.Series(loss).rolling(period).mean().values
+        rsi_vals = 100 - 100 / (1 + avg_gain / (avg_loss + 1e-10))
+        rsi_smooth = pd.Series(rsi_vals).ewm(span=2, adjust=False).mean().values
+        rsi_4h = pd.Series(rsi_vals).rolling(16).mean().values
         feats = np.column_stack([
-            (rsi_14 - 50) / 10,
+            (rsi_vals - 50) / 10,
             (rsi_smooth - 50) / 10,
             (rsi_4h - 50) / 10,
         ])
-        btc_sma = self._btc_trend.get_btc_sma_ratios()
+        if timestamp_ms is not None:
+            btc_sma = self._btc_trend.get_historical_btc_sma_ratios(timestamp_ms)
+        else:
+            btc_sma = self._btc_trend.get_btc_sma_ratios()
         btc_feats = np.tile(btc_sma, (len(feats), 1))
         feats = np.hstack([feats, btc_feats])
         funding_oi = np.zeros((len(feats), 4))
         feats = np.hstack([feats, funding_oi])
         feats = np.nan_to_num(feats, nan=0.0)
-        return feats[-seq_len:], rsi_14[-1]
+        return feats[-seq_len:], rsi_vals[-1]
 
     def _predict_long(self, tier, features):
         if tier not in self._models:
@@ -896,7 +917,7 @@ class LongShadowScanner:
                 continue
             if i < seq_len + 56 + 16:
                 continue
-            feats, _ = self._compute_features(closes[:i + 1], seq_len)
+            feats, _ = self._compute_features(closes[:i + 1], seq_len, ohlcv[i][0])
             if feats is None:
                 continue
             score = self._predict_long(tier, feats)
