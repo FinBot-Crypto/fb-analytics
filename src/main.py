@@ -203,10 +203,11 @@ class AnalyticsService:
 
     async def evaluate_leme_rules(self):
         settings = {}
+        leme_activation_time = datetime.min
         try:
             conn = psycopg2.connect(DATABASE_URL)
             cur = conn.cursor()
-            cur.execute("SELECT key, value FROM bot_settings")
+            cur.execute("SELECT key, value, updated_at FROM bot_settings")
             rows = cur.fetchall()
             for r in rows:
                 val = r[1]
@@ -216,6 +217,8 @@ class AnalyticsService:
                     except:
                         pass
                 settings[r[0]] = val
+                if r[0] == "leme_active" and r[2] is not None:
+                    leme_activation_time = r[2]
             cur.close()
             conn.close()
         except Exception as e:
@@ -270,9 +273,10 @@ class AnalyticsService:
                         WHERE status = 'CLOSED' 
                           AND direction = %s 
                           AND {symbol_filter} 
-                        ORDER BY created_at DESC 
+                          AND updated_at >= %s
+                        ORDER BY updated_at DESC 
                         LIMIT %s
-                    """, (direction.upper(), symbol_param, max_consecutive_sl))
+                    """, (direction.upper(), symbol_param, leme_activation_time, max_consecutive_sl))
                     recent_trades = cur.fetchall()
 
                     if len(recent_trades) >= max_consecutive_sl:
@@ -290,9 +294,10 @@ class AnalyticsService:
                         WHERE status = 'CLOSED' 
                           AND direction = %s 
                           AND {symbol_filter} 
-                        ORDER BY created_at DESC 
+                          AND updated_at >= %s
+                        ORDER BY updated_at DESC 
                         LIMIT 10
-                    """, (direction.upper(), symbol_param))
+                    """, (direction.upper(), symbol_param, leme_activation_time))
                     trades_10 = cur.fetchall()
                     if len(trades_10) >= 5:
                         wins = sum(1 for r in trades_10 if r[0] > 0)
