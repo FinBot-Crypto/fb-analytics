@@ -157,14 +157,215 @@ class AnalyticsService:
         except Exception as e:
             logger.error(f"Erro ao processar análise: {e}")
 
+    def apply_leme_disable(self, direction, tier, reason):
+        group_name = f"{direction}_{tier}"
+        allowed_key = f"{direction}_{tier}_allowed"
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES (%s, 'false'::jsonb, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET value = 'false'::jsonb, updated_at = CURRENT_TIMESTAMP
+            """, (allowed_key,))
+            cur.execute("""
+                INSERT INTO leme_decisions (group_name, action, reason, details)
+                VALUES (%s, 'DISABLE', %s, %s)
+            """, (group_name, reason, json.dumps({"timestamp": datetime.now().isoformat()})))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.warning(f"☸️ LEME: Grupo {group_name} DESATIVADO. Motivo: {reason}")
+        except Exception as e:
+            logger.error(f"Erro ao desativar grupo {group_name} no Leme: {e}")
+
+    def apply_leme_enable(self, direction, tier, reason):
+        group_name = f"{direction}_{tier}"
+        allowed_key = f"{direction}_{tier}_allowed"
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bot_settings (key, value, updated_at)
+                VALUES (%s, 'true'::jsonb, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET value = 'true'::jsonb, updated_at = CURRENT_TIMESTAMP
+            """, (allowed_key,))
+            cur.execute("""
+                INSERT INTO leme_decisions (group_name, action, reason, details)
+                VALUES (%s, 'ENABLE', %s, %s)
+            """, (group_name, reason, json.dumps({"timestamp": datetime.now().isoformat()})))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"☸️ LEME: Grupo {group_name} REATIVADO. Motivo: {reason}")
+        except Exception as e:
+            logger.error(f"Erro ao reativar grupo {group_name} no Leme: {e}")
+
+    async def evaluate_leme_rules(self):
+        settings = {}
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("SELECT key, value FROM bot_settings")
+            rows = cur.fetchall()
+            for r in rows:
+                val = r[1]
+                if isinstance(val, str):
+                    try:
+                        val = json.loads(val)
+                    except:
+                        pass
+                settings[r[0]] = val
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Leme Guardian: erro ao carregar configs do banco: {e}")
+            return
+
+        if not settings.get("leme_active", True):
+            return
+
+        tiers = ["Major", "Strong Alt", "High Volatility"]
+        directions = ["long", "short"]
+        groups = []
+        for d in directions:
+            for t in tiers:
+                groups.append((d, t))
+
+        max_consecutive_sl = int(settings.get("leme_max_consecutive_sl", 3))
+        min_win_rate = float(settings.get("leme_min_win_rate", 50.0))
+        cooldown_hours = float(settings.get("leme_cooldown_hours", 24.0))
+        shadow_min_trades = int(settings.get("leme_shadow_min_trades", 5))
+        shadow_min_winrate = float(settings.get("leme_shadow_min_winrate", 60.0))
+
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+
+            cur.execute("SELECT symbol, tier FROM market_selection")
+            symbol_tiers = {r[0]: r[1] for r in cur.fetchall()}
+
+            for direction, tier in groups:
+                group_name = f"{direction}_{tier}"
+                allowed_key = f"{direction}_{tier}_allowed"
+                is_allowed = settings.get(allowed_key, True)
+
+                tier_symbols = [sym for sym, t in symbol_tiers.items() if t == tier]
+                if not tier_symbols:
+                    continue
+
+                if len(tier_symbols) == 1:
+                    symbol_filter = "symbol = %s"
+                    symbol_param = tier_symbols[0]
+                else:
+                    symbol_filter = "symbol IN %s"
+                    symbol_param = tuple(tier_symbols)
+
+                if is_allowed:
+                    # GRUPO ATIVO: Avaliar se precisa DESATIVAR (DISABLE)
+                    # A. Stop Losses consecutivos
+                    cur.execute(f"""
+                        SELECT pnl_pct 
+                        FROM trade_log 
+                        WHERE status = 'CLOSED' 
+                          AND direction = %s 
+                          AND {symbol_filter} 
+                        ORDER BY created_at DESC 
+                        LIMIT %s
+                    """, (direction.upper(), symbol_param, max_consecutive_sl))
+                    recent_trades = cur.fetchall()
+
+                    if len(recent_trades) >= max_consecutive_sl:
+                        all_losses = all(r[0] < 0 for r in recent_trades)
+                        if all_losses:
+                            reason = f"Atingiu o limite de {max_consecutive_sl} Stop Losses consecutivos em operações reais."
+                            self.apply_leme_disable(direction, tier, reason)
+                            settings[allowed_key] = False
+                            continue
+
+                    # B. Win-Rate recente de 10 trades
+                    cur.execute(f"""
+                        SELECT pnl_pct 
+                        FROM trade_log 
+                        WHERE status = 'CLOSED' 
+                          AND direction = %s 
+                          AND {symbol_filter} 
+                        ORDER BY created_at DESC 
+                        LIMIT 10
+                    """, (direction.upper(), symbol_param))
+                    trades_10 = cur.fetchall()
+                    if len(trades_10) >= 5:
+                        wins = sum(1 for r in trades_10 if r[0] > 0)
+                        wr = (wins / len(trades_10)) * 100
+                        if wr < min_win_rate:
+                            reason = f"Win-Rate real de {wr:.1f}% caiu abaixo do limite de {min_win_rate}% nos últimos {len(trades_10)} trades."
+                            self.apply_leme_disable(direction, tier, reason)
+                            settings[allowed_key] = False
+                            continue
+                else:
+                    # GRUPO PAUSADO: Avaliar se precisa REATIVAR (ENABLE)
+                    # A. Cooldown check
+                    cur.execute("""
+                        SELECT created_at 
+                        FROM leme_decisions 
+                        WHERE group_name = %s AND action = 'DISABLE' 
+                        ORDER BY created_at DESC 
+                        LIMIT 1
+                    """, (group_name,))
+                    last_disable = cur.fetchone()
+                    if last_disable:
+                        from datetime import timezone
+                        disable_ts = last_disable[0].replace(tzinfo=timezone.utc)
+                        elapsed = (datetime.now(timezone.utc) - disable_ts).total_seconds() / 3600.0
+                        if elapsed < cooldown_hours:
+                            continue
+
+                    # B. Shadow Recovery check
+                    if direction == "long":
+                        cur.execute("""
+                            SELECT pnl FROM shadow_long_scan 
+                            WHERE tier = %s AND sl = 3.0 AND tp = 3.0 
+                            ORDER BY entry_ts DESC LIMIT %s
+                        """, (tier, shadow_min_trades))
+                    else:
+                        cur.execute("""
+                            SELECT pnl FROM shadow_short_metrics 
+                            WHERE tier = %s AND sl = 3.0 AND tp = 3.0 
+                            ORDER BY entry_ts DESC LIMIT %s
+                        """, (tier, shadow_min_trades))
+
+                    shadow_trades = cur.fetchall()
+                    if len(shadow_trades) >= shadow_min_trades:
+                        wins = sum(1 for r in shadow_trades if r[0] > 0)
+                        wr = (wins / len(shadow_trades)) * 100
+                        if wr >= shadow_min_winrate:
+                            reason = f"Recuperação detectada no Shadow: Win-rate de {wr:.1f}% nos últimos {len(shadow_trades)} trades simulados (mín: {shadow_min_winrate}%)."
+                            self.apply_leme_enable(direction, tier, reason)
+                            settings[allowed_key] = True
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Erro ao avaliar regras do Leme Guardian: {e}")
+
+    async def run_leme_guardian_loop(self):
+        logger.info("Leme Guardian Loop iniciado.")
+        while True:
+            try:
+                await self.evaluate_leme_rules()
+            except Exception as e:
+                logger.error(f"Erro no ciclo do Leme Guardian: {e}")
+            await asyncio.sleep(600)  # Executa a cada 10 minutos
+
     async def handle_trade_closed(self, msg):
         """Ao fechar um trade, espera uns segundos e roda as analises"""
         try:
             data = json.loads(msg.data.decode())
             logger.info(f"Trade recebido: {data['symbol']} fechou com {data['pnl_pct']}%")
             
-            # Roda as estatísticas
+            # Roda as estatísticas e avalia o Leme imediatamente
             self.run_analysis()
+            await self.evaluate_leme_rules()
             
             await msg.ack()
         except Exception as e:
@@ -176,6 +377,7 @@ class AnalyticsService:
 
         # Roda uma vez no inicio para pegar o estado atual
         self.run_analysis()
+        await self.evaluate_leme_rules()
 
         await self.js.subscribe("trade.closed", durable="ANALYTICS_WORKER",
                                  cb=self.handle_trade_closed, manual_ack=True,
@@ -194,6 +396,9 @@ class AnalyticsService:
         # Inicia o simulador fantasma SHORT em background
         short_shadow = ShortShadowScanner(DATABASE_URL)
         asyncio.create_task(short_shadow.run_loop())
+
+        # Inicia o loop periódico do Leme Guardian
+        asyncio.create_task(self.run_leme_guardian_loop())
         
         while True:
             if self.nc.is_closed:
