@@ -19,6 +19,8 @@ logger = logging.getLogger("fb-analytics")
 
 NATS_URL = os.getenv("NATS_URL", "nats://crypto-nats:4222")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://crypto_admin:ZNG5z43LaSrk7FEmwu6CPtRUB2IVKdvY@crypto-postgres:5432/crypto_bot")
+EVALUATIONS_LOG_RETENTION_DAYS = int(os.getenv("EVALUATIONS_LOG_RETENTION_DAYS", "45"))
+RETENTION_CLEANUP_INTERVAL = int(os.getenv("RETENTION_CLEANUP_INTERVAL", str(24 * 3600)))
 
 class AnalyticsService:
     def __init__(self):
@@ -54,6 +56,67 @@ class AnalyticsService:
             logger.info("Tabela daily_metrics inicializada.")
         except Exception as e:
             logger.error(f"Erro ao inicializar DB: {e}")
+
+    def ensure_evaluations_log_index(self):
+        """Índice para cleanup e queries do dashboard por created_at."""
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_evaluations_log_created_at
+                ON evaluations_log (created_at);
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Erro ao criar índice em evaluations_log: {e}")
+
+    def cleanup_evaluations_log(self):
+        """Remove avaliações antigas — histórico recente basta para dashboard e Leme."""
+        if EVALUATIONS_LOG_RETENTION_DAYS <= 0:
+            return 0
+
+        try:
+            conn = psycopg2.connect(DATABASE_URL)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                DELETE FROM evaluations_log
+                WHERE created_at < NOW() - (%s * INTERVAL '1 day')
+                """,
+                (EVALUATIONS_LOG_RETENTION_DAYS,),
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+            if deleted:
+                logger.info(
+                    "Retenção evaluations_log: %s registros removidos (>%s dias).",
+                    deleted,
+                    EVALUATIONS_LOG_RETENTION_DAYS,
+                )
+            return deleted
+        except Exception as e:
+            logger.error(f"Erro ao limpar evaluations_log: {e}")
+            return 0
+
+    async def run_retention_cleanup_loop(self):
+        """Executa purge diário de evaluations_log."""
+        logger.info(
+            "Retention loop iniciado (evaluations_log > %s dias, intervalo %sh).",
+            EVALUATIONS_LOG_RETENTION_DAYS,
+            RETENTION_CLEANUP_INTERVAL // 3600,
+        )
+        self.ensure_evaluations_log_index()
+        self.cleanup_evaluations_log()
+        while True:
+            await asyncio.sleep(RETENTION_CLEANUP_INTERVAL)
+            try:
+                self.cleanup_evaluations_log()
+            except Exception as e:
+                logger.error(f"Erro no ciclo de retenção: {e}")
 
     def run_analysis(self):
         """
@@ -423,6 +486,9 @@ class AnalyticsService:
 
         # Inicia o loop periódico do Leme Guardian
         asyncio.create_task(self.run_leme_guardian_loop())
+
+        # Retenção automática de evaluations_log
+        asyncio.create_task(self.run_retention_cleanup_loop())
         
         while True:
             if self.nc.is_closed:
